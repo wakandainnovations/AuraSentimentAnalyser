@@ -13,10 +13,18 @@ import org.apache.http.util.EntityUtils;
 import java.io.IOException;
 import java.io.InputStream;
 import java.sql.*;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 public class SentimentAnalysis {
@@ -49,6 +57,12 @@ public class SentimentAnalysis {
     private static final String PROMPT_POLITICS_PARTY_TEMPLATE;
     private static final String PROMPT_CLASSIFICATION_MOVIE_TEMPLATE;
 
+    // How many LLM calls the scoring loop keeps in flight at once (llm.parallelism, default 8).
+    // The cloud model answers ~1s per call and handled 16 concurrent calls without a 429 in
+    // testing; set it to 1 for the old one-at-a-time behaviour.
+    private static final int LLM_PARALLELISM;
+    private static final ExecutorService LLM_POOL;
+
     static {
         Properties props = new Properties();
         try (InputStream input = SentimentAnalysis.class.getClassLoader().getResourceAsStream("application.properties")) {
@@ -75,6 +89,12 @@ public class SentimentAnalysis {
             PROMPT_POLITICS_CAMPAIGN_TEMPLATE = props.getProperty("prompt.politics.campaign");
             PROMPT_POLITICS_PARTY_TEMPLATE = props.getProperty("prompt.politics.party");
             PROMPT_CLASSIFICATION_MOVIE_TEMPLATE = props.getProperty("prompt.classification.movie");
+            LLM_PARALLELISM = Math.max(1, Integer.parseInt(props.getProperty("llm.parallelism", "8").trim()));
+            LLM_POOL = Executors.newFixedThreadPool(LLM_PARALLELISM, r -> {
+                Thread t = new Thread(r, "llm-call");
+                t.setDaemon(true);
+                return t;
+            });
         } catch (IOException ex) {
             throw new RuntimeException("Error loading application.properties", ex);
         }
@@ -119,15 +139,22 @@ public class SentimentAnalysis {
                     try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
                         while (!Thread.currentThread().isInterrupted()) {
                             markRetweets(conn);
-                            processTable(conn, "x_posts", "created_at");
+                            // Rows sent for initial scoring this pass. Classification isn't counted:
+                            // a row it can't classify stays eligible and would keep the loop spinning.
+                            int scored = 0;
+                            scored += processTable(conn, "x_posts", "created_at");
                             processClassification(conn, "x_posts", "created_at");
-                            processTable(conn, "instagram_posts", "timestamp");
+                            scored += processTable(conn, "instagram_posts", "timestamp");
                             processClassification(conn, "instagram_posts", "timestamp");
-                            processTableYoutube(conn, "published_at");
+                            scored += processTableYoutube(conn, "published_at");
                             processClassificationYoutube(conn, "published_at");
-                            processRedditPosts(conn);
+                            scored += processRedditPosts(conn);
                             processClassificationReddit(conn, "created_at");
-                            Thread.sleep(pollIntervalMillis);
+                            // Go straight into the next pass while there is a backlog; only wait
+                            // for new posts once a pass found nothing left to score.
+                            if (scored == 0) {
+                                Thread.sleep(pollIntervalMillis);
+                            }
                         }
                     } catch (SQLException | RuntimeException e) {
                         // RuntimeException too: an unexpected bug in one pass would otherwise end
@@ -244,6 +271,49 @@ public class SentimentAnalysis {
         }
     }
 
+    @FunctionalInterface
+    private interface LlmCall<T> {
+        T call(String[] row) throws IOException;
+    }
+
+    @FunctionalInterface
+    private interface RowWriter<T> {
+        void write(String[] row, T result) throws SQLException;
+    }
+
+    // Runs the LLM call for every row on LLM_POOL (LLM_PARALLELISM at a time) and writes each result
+    // on the calling thread as soon as it arrives, so the shared JDBC connection is only ever used by
+    // one thread. A row whose call fails (after callSentimentApi's own retries) is logged and
+    // skipped without writing anything, exactly as the old sequential loops did.
+    private static <T> void runLlmBatch(String label, List<String[]> rows, LlmCall<T> call, RowWriter<T> writer)
+            throws SQLException {
+        CompletionService<T> completion = new ExecutorCompletionService<>(LLM_POOL);
+        Map<Future<T>, String[]> rowOf = new IdentityHashMap<>();
+        for (String[] row : rows) {
+            rowOf.put(completion.submit(() -> call.call(row)), row);
+        }
+        try {
+            for (int i = 0; i < rows.size(); i++) {
+                Future<T> done = completion.take();
+                String[] row = rowOf.get(done);
+                try {
+                    writer.write(row, done.get());
+                } catch (ExecutionException e) {
+                    Throwable cause = e.getCause();
+                    System.err.println("Error calling LLM for " + label + " ID: " + row[0] + ". "
+                            + (cause instanceof IOException ? cause.getMessage() : String.valueOf(cause)));
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            // Only does anything if we bailed out early (interrupt or a DB error while writing).
+            for (Future<T> f : rowOf.keySet()) {
+                f.cancel(true);
+            }
+        }
+    }
+
     // Adds the sentiment_passes column the first time the service runs against a table. Rows that
     // already have a sentiment_score were scored by the initial prompt before tracking existed, so
     // they're backfilled as having had that pass; nothing is known about which refinement prompts
@@ -302,32 +372,35 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void processRedditPosts(Connection conn) throws SQLException {
+    private static int processRedditPosts(Connection conn) throws SQLException {
+        // Newest first and capped like the other tables, so a big Reddit backlog doesn't hold up
+        // the rest of the loop.
         String sql = "SELECT id, title, text, keyword, sentiment_category FROM reddit_posts" +
                 " WHERE keyword IS NOT NULL AND TRIM(keyword) <> ''" +
-                " AND NOT ('" + PASS_INITIAL + "' = ANY(sentiment_passes))";
+                " AND NOT ('" + PASS_INITIAL + "' = ANY(sentiment_passes))" +
+                " ORDER BY created_at DESC NULLS LAST LIMIT " + PASS_LIMIT;
+        List<String[]> batch = new ArrayList<>();
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
-
             while (rs.next()) {
-                String id = rs.getString("id");
-                String title = rs.getString("title");
-                String text = rs.getString("text");
-                String keyword = rs.getString("keyword");
-                String category = rs.getString("sentiment_category");
-
-                if (keyword != null && !keyword.trim().isEmpty()) {
-                    try {
-                        SentimentResponse sentimentResponse = getRedditSentiment(title, text, keyword, category);
-                        System.out.println("Updating sentiment score for id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
-                        updateSentimentScore(conn, "reddit_posts", id, sentimentResponse);
-                        markPassDone(conn, "reddit_posts", id, PASS_INITIAL);
-                    } catch (IOException e) {
-                        System.err.println("Error calling sentiment analysis API for reddit_posts ID: " + id + ". " + e.getMessage());
-                    }
-                }
+                batch.add(new String[]{
+                        rs.getString("id"),
+                        rs.getString("title"),
+                        rs.getString("text"),
+                        rs.getString("keyword"),
+                        rs.getString("sentiment_category")
+                });
             }
         }
+
+        runLlmBatch("reddit_posts sentiment", batch,
+                row -> getRedditSentiment(row[1], row[2], row[3], row[4]),
+                (row, sentimentResponse) -> {
+                    System.out.println("Updating sentiment score for id: " + row[0] + ", keyword: " + row[3] + ", score: " + sentimentResponse.getPositivityScore());
+                    updateSentimentScore(conn, "reddit_posts", row[0], sentimentResponse);
+                    markPassDone(conn, "reddit_posts", row[0], PASS_INITIAL);
+                });
+        return batch.size();
     }
 
     // Reddit posts carry a separate title and body, so score both and average them rather
@@ -482,7 +555,7 @@ public class SentimentAnalysis {
         }
     }
 
-    private static void processTable(Connection conn, String tableName, String timestampColumn) throws SQLException {
+    private static int processTable(Connection conn, String tableName, String timestampColumn) throws SQLException {
         // Only score rows the initial prompt hasn't run on yet, newest timestamp first, in a capped
         // pass so classification still gets a turn. Rows already scored (including those scored 0)
         // are never re-sent to the LLM - see sentiment_passes.
@@ -506,20 +579,14 @@ public class SentimentAnalysis {
             }
         }
 
-        for (String[] row : batch) {
-            String id = row[0];
-            String text = row[1];
-            String keyword = row[2];
-            String category = row[3];
-            try {
-                SentimentResponse sentimentResponse = getAverageSentimentScore(text, keyword, category);
-                System.out.println("Updating sentiment score for id (generic): " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
-                updateSentimentScore(conn, tableName, id, sentimentResponse);
-                markPassDone(conn, tableName, id, PASS_INITIAL);
-            } catch (IOException e) {
-                System.err.println("Error calling sentiment analysis API for " + tableName + " ID: " + id + ". " + e.getMessage());
-            }
-        }
+        runLlmBatch(tableName + " sentiment", batch,
+                row -> getAverageSentimentScore(row[1], row[2], row[3]),
+                (row, sentimentResponse) -> {
+                    System.out.println("Updating sentiment score for id (generic): " + row[0] + ", keyword: " + row[2] + ", score: " + sentimentResponse.getPositivityScore());
+                    updateSentimentScore(conn, tableName, row[0], sentimentResponse);
+                    markPassDone(conn, tableName, row[0], PASS_INITIAL);
+                });
+        return batch.size();
     }
 
     // YouTube comments are replies to a video, not self-contained posts - a short reaction like
@@ -527,7 +594,7 @@ public class SentimentAnalysis {
     // the comment text alone starves the LLM of the context it needs to tell a genuine fan reaction
     // apart from an unrelated comment that happened to be scraped under this keyword. Prefixing the
     // video title (mirrors how reddit's title+text combination gives the LLM the same kind of anchor).
-    private static void processTableYoutube(Connection conn, String timestampColumn) throws SQLException {
+    private static int processTableYoutube(Connection conn, String timestampColumn) throws SQLException {
         String sql = "SELECT id, text, video_title, keyword, sentiment_category FROM youtube_comments" +
                 " WHERE text IS NOT NULL AND TRIM(text) <> ''" +
                 " AND keyword IS NOT NULL AND TRIM(keyword) <> ''" +
@@ -548,22 +615,18 @@ public class SentimentAnalysis {
             }
         }
 
-        for (String[] row : batch) {
-            String id = row[0];
-            String text = row[1];
-            String videoTitle = row[2];
-            String keyword = row[3];
-            String category = row[4];
-            String combinedText = (videoTitle != null && !videoTitle.trim().isEmpty()) ? videoTitle + "\n" + text : text;
-            try {
-                SentimentResponse sentimentResponse = getAverageSentimentScore(combinedText, keyword, category);
-                System.out.println("Updating sentiment score for youtube_comments id: " + id + ", keyword: " + keyword + ", score: " + sentimentResponse.getPositivityScore());
-                updateSentimentScore(conn, "youtube_comments", id, sentimentResponse);
-                markPassDone(conn, "youtube_comments", id, PASS_INITIAL);
-            } catch (IOException e) {
-                System.err.println("Error calling sentiment analysis API for youtube_comments ID: " + id + ". " + e.getMessage());
-            }
-        }
+        runLlmBatch("youtube_comments sentiment", batch,
+                row -> {
+                    String videoTitle = row[2];
+                    String combinedText = (videoTitle != null && !videoTitle.trim().isEmpty()) ? videoTitle + "\n" + row[1] : row[1];
+                    return getAverageSentimentScore(combinedText, row[3], row[4]);
+                },
+                (row, sentimentResponse) -> {
+                    System.out.println("Updating sentiment score for youtube_comments id: " + row[0] + ", keyword: " + row[3] + ", score: " + sentimentResponse.getPositivityScore());
+                    updateSentimentScore(conn, "youtube_comments", row[0], sentimentResponse);
+                    markPassDone(conn, "youtube_comments", row[0], PASS_INITIAL);
+                });
+        return batch.size();
     }
 
     private static void processClassificationYoutube(Connection conn, String timestampColumn) throws SQLException {
@@ -575,26 +638,27 @@ public class SentimentAnalysis {
                 // Only relevant rows (score > 0) reach mentions; capped so the loop keeps cycling.
                 " AND sentiment_score > 0" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+        List<String[]> batch = new ArrayList<>();
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
-
             while (rs.next()) {
-                String id = rs.getString("id");
                 String text = rs.getString("text");
                 String videoTitle = rs.getString("video_title");
-                String keyword = rs.getString("keyword");
-                String author = rs.getString("author");
-                String combinedText = (videoTitle != null && !videoTitle.trim().isEmpty()) ? videoTitle + "\n" + text : text;
-
-                try {
-                    ClassificationResponse classificationResponse = getContentClassification(combinedText, keyword, author);
-                    System.out.println("Updating classification for youtube_comments id: " + id + ", author_type: " + classificationResponse.getAuthorType());
-                    updateClassification(conn, "youtube_comments", id, classificationResponse);
-                } catch (IOException e) {
-                    System.err.println("Error calling classification API for youtube_comments ID: " + id + ". " + e.getMessage());
-                }
+                batch.add(new String[]{
+                        rs.getString("id"),
+                        (videoTitle != null && !videoTitle.trim().isEmpty()) ? videoTitle + "\n" + text : text,
+                        rs.getString("keyword"),
+                        rs.getString("author")
+                });
             }
         }
+
+        runLlmBatch("youtube_comments classification", batch,
+                row -> getContentClassification(row[1], row[2], row[3]),
+                (row, classificationResponse) -> {
+                    System.out.println("Updating classification for youtube_comments id: " + row[0] + ", author_type: " + classificationResponse.getAuthorType());
+                    updateClassification(conn, "youtube_comments", row[0], classificationResponse);
+                });
     }
 
     // Classification (author_type/content_intent/predicted_region/topic_category) is only defined
@@ -609,24 +673,25 @@ public class SentimentAnalysis {
                 // Only relevant rows (score > 0) reach mentions; capped so the loop keeps cycling.
                 " AND sentiment_score > 0" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+        List<String[]> batch = new ArrayList<>();
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
-
             while (rs.next()) {
-                String id = rs.getString("id");
-                String text = rs.getString("text");
-                String keyword = rs.getString("keyword");
-                String author = rs.getString("author");
-
-                try {
-                    ClassificationResponse classificationResponse = getContentClassification(text, keyword, author);
-                    System.out.println("Updating classification for id: " + id + ", author_type: " + classificationResponse.getAuthorType());
-                    updateClassification(conn, tableName, id, classificationResponse);
-                } catch (IOException e) {
-                    System.err.println("Error calling classification API for " + tableName + " ID: " + id + ". " + e.getMessage());
-                }
+                batch.add(new String[]{
+                        rs.getString("id"),
+                        rs.getString("text"),
+                        rs.getString("keyword"),
+                        rs.getString("author")
+                });
             }
         }
+
+        runLlmBatch(tableName + " classification", batch,
+                row -> getContentClassification(row[1], row[2], row[3]),
+                (row, classificationResponse) -> {
+                    System.out.println("Updating classification for id: " + row[0] + ", author_type: " + classificationResponse.getAuthorType());
+                    updateClassification(conn, tableName, row[0], classificationResponse);
+                });
     }
 
     private static void processClassificationReddit(Connection conn, String timestampColumn) throws SQLException {
@@ -637,26 +702,27 @@ public class SentimentAnalysis {
                 // Only relevant rows (score > 0) reach mentions; capped so the loop keeps cycling.
                 " AND sentiment_score > 0" +
                 " ORDER BY " + timestampColumn + " DESC NULLS LAST LIMIT " + PASS_LIMIT;
+        List<String[]> batch = new ArrayList<>();
         try (Statement stmt = conn.createStatement();
              ResultSet rs = stmt.executeQuery(sql)) {
-
             while (rs.next()) {
-                String id = rs.getString("id");
                 String title = rs.getString("title");
                 String text = rs.getString("text");
-                String keyword = rs.getString("keyword");
-                String author = rs.getString("author");
-                String combinedText = (text != null && !text.trim().isEmpty()) ? title + "\n" + text : title;
-
-                try {
-                    ClassificationResponse classificationResponse = getContentClassification(combinedText, keyword, author);
-                    System.out.println("Updating classification for reddit_posts id: " + id + ", author_type: " + classificationResponse.getAuthorType());
-                    updateClassification(conn, "reddit_posts", id, classificationResponse);
-                } catch (IOException e) {
-                    System.err.println("Error calling classification API for reddit_posts ID: " + id + ". " + e.getMessage());
-                }
+                batch.add(new String[]{
+                        rs.getString("id"),
+                        (text != null && !text.trim().isEmpty()) ? title + "\n" + text : title,
+                        rs.getString("keyword"),
+                        rs.getString("author")
+                });
             }
         }
+
+        runLlmBatch("reddit_posts classification", batch,
+                row -> getContentClassification(row[1], row[2], row[3]),
+                (row, classificationResponse) -> {
+                    System.out.println("Updating classification for reddit_posts id: " + row[0] + ", author_type: " + classificationResponse.getAuthorType());
+                    updateClassification(conn, "reddit_posts", row[0], classificationResponse);
+                });
     }
 
     private static ClassificationResponse getContentClassification(String text, String keyword, String author) throws IOException {
@@ -666,6 +732,7 @@ public class SentimentAnalysis {
     private static ClassificationResponse callClassificationApi(String promptTemplate, String text, String keyword, String author) throws IOException {
         int maxRetries = 20;
         int retryCount = 0;
+        int proseReplies = 0;
         while (true) {
             try (CloseableHttpClient httpClient = HttpClients.custom().setDefaultRequestConfig(HTTP_REQUEST_CONFIG).build()) {
                 HttpPost httpPost = new HttpPost(LLM_URL);
@@ -694,10 +761,20 @@ public class SentimentAnalysis {
                     int lastBrace = responseString.lastIndexOf('}');
 
                     if (firstBrace == -1 || lastBrace == -1 || lastBrace <= firstBrace) {
-                        // An error body (e.g. "Error from Ollama: 429"), not a classification - retry
-                        // and, failing that, let the caller skip the row so it is classified later.
-                        throw new IOException("LLM returned no JSON for classification (HTTP "
-                                + response.getStatusLine().getStatusCode() + "): " + abbreviate(responseString));
+                        if (isServiceError(response.getStatusLine().getStatusCode(), responseString)) {
+                            // An error body (e.g. "Error from Ollama: 429"), not a classification - retry
+                            // and, failing that, let the caller skip the row so it is classified later.
+                            throw new IOException("LLM returned no JSON for classification (HTTP "
+                                    + response.getStatusLine().getStatusCode() + "): " + abbreviate(responseString));
+                        }
+                        // A prose reply about the post itself: ask again quickly, then give up the
+                        // same way as unparseable JSON below.
+                        if (++proseReplies < MAX_PROSE_REPLIES) {
+                            continue;
+                        }
+                        System.err.println("LLM replied without JSON " + MAX_PROSE_REPLIES + " times for classification: "
+                                + abbreviate(responseString));
+                        return new ClassificationResponse();
                     }
 
                     String jsonResponse = responseString.substring(firstBrace, lastBrace + 1);
@@ -907,6 +984,7 @@ public class SentimentAnalysis {
     private static SentimentResponse callSentimentApi(String promptTemplate, String text, String keyword) throws IOException {
         int maxRetries = 20;
         int retryCount = 0;
+        int proseReplies = 0;
         while (true) {
             try (CloseableHttpClient httpClient = HttpClients.custom().setDefaultRequestConfig(HTTP_REQUEST_CONFIG).build()) {
                 HttpPost httpPost = new HttpPost(LLM_URL);
@@ -941,13 +1019,28 @@ public class SentimentAnalysis {
                     }
 
                     if (jsonResponse == null) {
-                        // No JSON at all means the call failed (e.g. aura-llm relays an upstream
-                        // "Error from Ollama: 429" with HTTP 200), not that the post is irrelevant.
-                        // Throw so the retry loop below backs off and, if it keeps failing, the
-                        // caller skips the row WITHOUT saving a score or marking the pass done -
-                        // it is picked up again on a later pass.
-                        throw new IOException("LLM returned no JSON (HTTP " + response.getStatusLine().getStatusCode()
-                                + "): " + abbreviate(responseString));
+                        if (isServiceError(response.getStatusLine().getStatusCode(), responseString)) {
+                            // The call failed (e.g. aura-llm relays "Error from Ollama: 429" with
+                            // HTTP 200), which says nothing about the post. Throw so the retry loop
+                            // below backs off and, if it keeps failing, the caller skips the row
+                            // WITHOUT saving a score or marking the pass done.
+                            throw new IOException("LLM returned no JSON (HTTP " + response.getStatusLine().getStatusCode()
+                                    + "): " + abbreviate(responseString));
+                        }
+                        // The model answered in prose instead (e.g. "Please provide the input post..."
+                        // for an emoji-only or link-only post). That's about the post itself and
+                        // repeats on retry, so try a couple more times quickly, then treat it like
+                        // unparseable JSON below (irrelevant) instead of 20 retries 30s apart.
+                        if (++proseReplies < MAX_PROSE_REPLIES) {
+                            System.err.println("LLM replied without JSON (" + abbreviate(responseString) + "). Asking again ("
+                                    + proseReplies + "/" + MAX_PROSE_REPLIES + ")...");
+                            continue;
+                        }
+                        System.err.println("LLM replied without JSON " + MAX_PROSE_REPLIES + " times for keyword " + keyword
+                                + "; treating the post as irrelevant.");
+                        SentimentResponse irrelevant = new SentimentResponse();
+                        irrelevant.setPositivityScore(-1.0);
+                        return irrelevant;
                     }
 
                     try {
@@ -978,6 +1071,21 @@ public class SentimentAnalysis {
                 }
             }
         }
+    }
+
+    // Prose (non-JSON) replies allowed per post before it's treated as unparseable.
+    private static final int MAX_PROSE_REPLIES = 3;
+
+    // True when a no-JSON reply is a failed call rather than the model talking about the post:
+    // a non-200 status, an empty body, or aura-llm's relayed error text ("Error from Ollama: 429",
+    // "Internal Server Error: ...", "Bedrock Error: ...").
+    private static boolean isServiceError(int statusCode, String body) {
+        if (statusCode != 200 || body == null || body.isBlank()) {
+            return true;
+        }
+        String b = body.trim();
+        return b.startsWith("Error from") || b.startsWith("Internal Server Error") || b.startsWith("Bedrock Error")
+                || b.startsWith("Error:");
     }
 
     private static String abbreviate(String s) {
