@@ -110,29 +110,39 @@ public class SentimentAnalysis {
         try {
             executor.submit(() -> {
                 // Poll continuously: drain both tables, wait, then re-check for rows that
-                // data collection inserted in the meantime. Runs until interrupted (e.g. on
-                // executor shutdown) or the connection drops.
+                // data collection inserted in the meantime. Runs until the process is stopped.
+                // A dropped connection (e.g. Postgres restarting) reconnects after a minute instead
+                // of ending the loop, so the service keeps scoring new posts unattended.
                 long pollIntervalMillis = TimeUnit.MINUTES.toMillis(5);
-                try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
-                    while (!Thread.currentThread().isInterrupted()) {
-                        markRetweets(conn);
-                        processTable(conn, "x_posts", "created_at");
-                        processClassification(conn, "x_posts", "created_at");
-                        processTable(conn, "instagram_posts", "timestamp");
-                        processClassification(conn, "instagram_posts", "timestamp");
-                        processTableYoutube(conn, "published_at");
-                        processClassificationYoutube(conn, "published_at");
-                        processRedditPosts(conn);
-                        processClassificationReddit(conn, "created_at");
-                        try {
+                long reconnectDelayMillis = TimeUnit.MINUTES.toMillis(1);
+                while (!Thread.currentThread().isInterrupted()) {
+                    try (Connection conn = DriverManager.getConnection(DB_URL, USER, PASS)) {
+                        while (!Thread.currentThread().isInterrupted()) {
+                            markRetweets(conn);
+                            processTable(conn, "x_posts", "created_at");
+                            processClassification(conn, "x_posts", "created_at");
+                            processTable(conn, "instagram_posts", "timestamp");
+                            processClassification(conn, "instagram_posts", "timestamp");
+                            processTableYoutube(conn, "published_at");
+                            processClassificationYoutube(conn, "published_at");
+                            processRedditPosts(conn);
+                            processClassificationReddit(conn, "created_at");
                             Thread.sleep(pollIntervalMillis);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            break;
                         }
+                    } catch (SQLException | RuntimeException e) {
+                        // RuntimeException too: an unexpected bug in one pass would otherwise end
+                        // this task silently (the executor swallows it) and scoring would stop.
+                        System.err.println("Error in the scoring loop: " + e
+                                + ". Reconnecting in " + TimeUnit.MILLISECONDS.toSeconds(reconnectDelayMillis) + "s...");
+                        e.printStackTrace();
+                        try {
+                            Thread.sleep(reconnectDelayMillis);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
                     }
-                } catch (SQLException e) {
-                    System.err.println("Error processing x_posts: " + e.getMessage());
                 }
             });
 //            executor.submit(() -> {
@@ -218,10 +228,14 @@ public class SentimentAnalysis {
                 }
             });
         } finally {
+            // shutdown() only stops new submissions: the one-shot refinement tasks finish on their
+            // own, and the polling task above runs until the process is stopped. Previously this
+            // waited 60 minutes and then called shutdownNow(), which interrupted the polling loop
+            // and made the whole service exit after about an hour.
             executor.shutdown();
             try {
-                if (!executor.awaitTermination(60, TimeUnit.MINUTES)) {
-                    executor.shutdownNow();
+                while (!executor.awaitTermination(1, TimeUnit.DAYS)) {
+                    // keep waiting - the polling loop is meant to run indefinitely
                 }
             } catch (InterruptedException e) {
                 executor.shutdownNow();
@@ -680,8 +694,10 @@ public class SentimentAnalysis {
                     int lastBrace = responseString.lastIndexOf('}');
 
                     if (firstBrace == -1 || lastBrace == -1 || lastBrace <= firstBrace) {
-                        System.err.println("Could not find a valid JSON object in the classification response.");
-                        return new ClassificationResponse();
+                        // An error body (e.g. "Error from Ollama: 429"), not a classification - retry
+                        // and, failing that, let the caller skip the row so it is classified later.
+                        throw new IOException("LLM returned no JSON for classification (HTTP "
+                                + response.getStatusLine().getStatusCode() + "): " + abbreviate(responseString));
                     }
 
                     String jsonResponse = responseString.substring(firstBrace, lastBrace + 1);
@@ -697,7 +713,7 @@ public class SentimentAnalysis {
                 if (++retryCount >= maxRetries) {
                     throw e;
                 }
-                System.err.println("LLM service is not reachable. Retrying in 30 seconds...");
+                System.err.println("LLM call failed (" + e.getMessage() + "). Retry " + retryCount + "/" + maxRetries + " in 30 seconds...");
                 try {
                     Thread.sleep(30000);
                 } catch (InterruptedException ie) {
@@ -925,10 +941,13 @@ public class SentimentAnalysis {
                     }
 
                     if (jsonResponse == null) {
-                        System.err.println("Could not find a valid JSON object in the response.");
-                        sentimentResponse = new SentimentResponse();
-                        sentimentResponse.setPositivityScore(-1.0);
-                        return sentimentResponse;
+                        // No JSON at all means the call failed (e.g. aura-llm relays an upstream
+                        // "Error from Ollama: 429" with HTTP 200), not that the post is irrelevant.
+                        // Throw so the retry loop below backs off and, if it keeps failing, the
+                        // caller skips the row WITHOUT saving a score or marking the pass done -
+                        // it is picked up again on a later pass.
+                        throw new IOException("LLM returned no JSON (HTTP " + response.getStatusLine().getStatusCode()
+                                + "): " + abbreviate(responseString));
                     }
 
                     try {
@@ -950,7 +969,7 @@ public class SentimentAnalysis {
                 if (++retryCount >= maxRetries) {
                     throw e;
                 }
-                System.err.println("LLM service is not reachable. Retrying in 30 seconds...");
+                System.err.println("LLM call failed (" + e.getMessage() + "). Retry " + retryCount + "/" + maxRetries + " in 30 seconds...");
                 try {
                     Thread.sleep(30000);
                 } catch (InterruptedException ie) {
@@ -959,6 +978,12 @@ public class SentimentAnalysis {
                 }
             }
         }
+    }
+
+    private static String abbreviate(String s) {
+        if (s == null) return "null";
+        String oneLine = s.replaceAll("\\s+", " ").trim();
+        return oneLine.length() <= 200 ? oneLine : oneLine.substring(0, 200) + "...";
     }
 
     private static boolean updateSentimentScore(Connection conn, String tableName, String id, SentimentResponse sentimentResponse) throws SQLException {
