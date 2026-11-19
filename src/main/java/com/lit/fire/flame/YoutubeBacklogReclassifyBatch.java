@@ -16,7 +16,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 // same video_title + text combination the fixed pipeline now uses going forward.
 public class YoutubeBacklogReclassifyBatch {
     private static final String URL = "jdbc:postgresql://localhost:5432/aura";
-    private static final String USER = "mukundv";
+    private static final String USER = "mukundvelusamy";
     private static final String PASS = "";
     private static final int WORKERS = 8;
 

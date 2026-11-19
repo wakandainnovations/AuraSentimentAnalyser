@@ -8,7 +8,7 @@ import java.util.concurrent.TimeUnit;
 
 public class TamilClassifyBatch {
     private static final String URL = "jdbc:postgresql://localhost:5432/aura";
-    private static final String USER = "mukundv";
+    private static final String USER = "mukundvelusamy";
     private static final String PASS = "";
 
     // Tamil movies in managed_entities released in the last 2 months (release_date >= 2026-06-09,
